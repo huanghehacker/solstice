@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: windows-latest # 从 windows-latest 改为 windows-2019
+    runs-on: windows-latest
     permissions:
       contents: write # 发布 Release 需要写入权限
 
@@ -25,40 +25,78 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install MSYS2 and binutils
-        uses: msys2/setup-msys2@v2
-        with:
-          update: true
-          install: mingw-w64-x86_64-binutils
+      # 使用 choco 安装 MinGW 以获取 ld.exe，替代之前繁琐的 MSYS2
+      - name: Install MinGW (provides ld.exe for resource embedding)
+        run: choco install mingw -y --no-progress
 
-      - name: Add MSYS2 mingw64 bin to PATH
+      # 稳健地配置 ld.exe 和 fxc.exe 的环境变量
+      - name: Add ld.exe and fxc.exe to PATH
         shell: pwsh
         run: |
-          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # MinGW binutils (ld) from chocolatey
+          $mingw = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
+          if (Test-Path $mingw) { Add-Content $env:GITHUB_PATH $mingw; Write-Output "mingw ok: $mingw" }
+          else { Get-ChildItem "C:\ProgramData\chocolatey\lib\mingw" -Recurse -Filter "ld.exe" | Select-Object -First 1 -ExpandProperty DirectoryName | ForEach-Object { Add-Content $env:GITHUB_PATH $_; Write-Output "mingw found: $_" } }
+          
+          # Windows SDK fxc.exe (HLSL shader compiler)
+          $sdk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory |
+                 Where-Object { $_.Name -match '^10\.' } |
+                 Sort-Object { [version]$_.Name } -Descending |
+                 Select-Object -First 1
+          $sdkBin = Join-Path $sdk.FullName "x64"
+          Add-Content $env:GITHUB_PATH $sdkBin
+          Write-Output "sdk bin: $sdkBin"
 
-      # 替代以前繁琐的脚本，完美解决 MSVC 环境报错
-      # 替代以前繁琐的脚本，完美解决 MSVC 环境报错
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-          # 新增：强制使用旧版工具集 (VS2019 的 v142 工具集)
-          toolset: 14.29
+      # 核心魔法：动态检测 VS 并强制锁定 v143 工具集以解决 Crypto++ 和 ICE 崩溃问题
+      - name: Detect Visual Studio
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -all -products * -format value -property installationPath
+          Write-Output "---"
+          $ver = & $vswhere -latest -products * -property catalog_productLineVersion
+          Write-Output "installed productLine: $ver"
+          $yearMap = @{ '17' = '2022'; '18' = '2026' }
+          if ($ver -and $yearMap[$ver]) {
+            Add-Content $env:GITHUB_ENV "VS_GENERATOR=Visual Studio $ver $($yearMap[$ver])"
+            # 锁定 v143 兼容旧代码
+            Add-Content $env:GITHUB_ENV "VS_TOOLSET=v143"
+            Write-Output "selected: Visual Studio $ver $($yearMap[$ver]) with -T v143"
+          } else {
+            Add-Content $env:GITHUB_ENV "VS_GENERATOR="
+            Add-Content $env:GITHUB_ENV "VS_TOOLSET="
+          }
 
-      # 换用 Ninja 构建，速度直接起飞
+      # 放弃 Ninja，回归原生的 Visual Studio Generator
       - name: Configure CMake
         shell: pwsh
-        run: cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+        run: |
+          if ($env:VS_GENERATOR) {
+            if ($env:VS_TOOLSET) {
+              cmake -B build -G "$env:VS_GENERATOR" -A x64 -T $env:VS_TOOLSET
+            } else {
+              cmake -B build -G "$env:VS_GENERATOR" -A x64
+            }
+          } else {
+            cmake -B build -A x64
+          }
 
+      # 构建项目，Visual Studio 生成器会默认把产物放在 build/Release 目录下
       - name: Build solution
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Locate outputs
         shell: pwsh
-        run: cmake --build build
+        run: Get-ChildItem -Recurse -Include *.dll,*.pdb build | Select-Object FullName, Length
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: solstice-dll
-          path: build/**/*.dll
+          path: |
+            build/Release/*.dll
+            build/Release/*.pdb
+          if-no-files-found: error
 
       # 仅在手动点击运行 (workflow_dispatch) 的时候才发布 Release
       - name: Publish GitHub Release
@@ -67,5 +105,5 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.version }}
           name: Release ${{ github.event.inputs.version }}
-          files: build/**/*.dll
+          files: build/Release/*.dll
           generate_release_notes: true
