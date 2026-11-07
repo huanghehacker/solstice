@@ -14,6 +14,7 @@
 #include <Hook/Hooks/MiscHooks/MouseHook.hpp>
 #include <SDK/Minecraft/Actor/Components/RuntimeIDComponent.hpp>
 #include <SDK/Minecraft/Inventory/Item.hpp>
+#include <SDK/Minecraft/Inventory/PlayerInventory.hpp>
 
 void AutoClicker::onEnable() {
     gFeatureManager->mDispatcher->listen<RenderEvent, &AutoClicker::onRenderEvent>(this);
