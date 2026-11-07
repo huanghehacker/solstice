@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2019 # 从 windows-latest 改为 windows-2019
     permissions:
       contents: write # 发布 Release 需要写入权限
 
