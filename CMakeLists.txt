@@ -63,8 +63,10 @@ CPMAddPackage(
         NAME cryptopp-cmake
         GITHUB_REPOSITORY abdes/cryptopp-cmake
         GIT_TAG master
+        OPTIONS
+            "CRYPTOPP_BUILD_TESTING OFF"
+            "BUILD_TESTING OFF"
 )
-
 if(MSVC)
     add_compile_options(/bigobj)
 endif()
