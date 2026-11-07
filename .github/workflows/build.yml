@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: windows-2019 # 从 windows-latest 改为 windows-2019
+    runs-on: windows-latest # 从 windows-latest 改为 windows-2019
     permissions:
       contents: write # 发布 Release 需要写入权限
 
@@ -37,10 +37,13 @@ jobs:
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       # 替代以前繁琐的脚本，完美解决 MSVC 环境报错
+      # 替代以前繁琐的脚本，完美解决 MSVC 环境报错
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          # 新增：强制使用旧版工具集 (VS2019 的 v142 工具集)
+          toolset: 14.29
 
       # 换用 Ninja 构建，速度直接起飞
       - name: Configure CMake
