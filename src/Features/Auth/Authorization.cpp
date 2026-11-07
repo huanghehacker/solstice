@@ -95,5 +95,6 @@ SysTime Auth::getOnlineTime()
     else
     {
         __fastfail(0);
+        return null;
     }
 }
