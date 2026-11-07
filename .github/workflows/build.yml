@@ -1,111 +1,284 @@
-name: CMake Windows Build
+name: Build and Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: '发布 Release 的版本号 (例如 v1.0.0)'
+        description: "Release version / tag"
         required: true
-        default: 'v1.0.0'
+        default: "v1.0.0"
+        type: string
+      build_type:
+        description: "Build type"
+        required: true
+        default: "Debug"
+        type: choice
+        options:
+          - Debug
+          - Release
 
-env:
-  BUILD_TYPE: Release
+permissions:
+  contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-${{ inputs.version }}-${{ inputs.build_type }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: windows-latest
-    permissions:
-      contents: write # 发布 Release 需要写入权限
+    name: ${{ inputs.build_type }} x64
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      BUILD_TYPE: ${{ inputs.build_type }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/cpm
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      # 使用 choco 安装 MinGW 以获取 ld.exe，替代之前繁琐的 MSYS2
-      - name: Install MinGW (provides ld.exe for resource embedding)
-        run: choco install mingw -y --no-progress
+      - name: Setup MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-      # 稳健地配置 ld.exe 和 fxc.exe 的环境变量
-      - name: Add ld.exe and fxc.exe to PATH
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/cpm
+            .cache/cryptopp-src
+          key: deps-${{ runner.os }}-${{ hashFiles('cmake/CPM.cmake', 'CMakeLists.txt') }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      - name: Setup toolchain
         shell: pwsh
         run: |
-          # MinGW binutils (ld) from chocolatey
-          $mingw = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
-          if (Test-Path $mingw) { Add-Content $env:GITHUB_PATH $mingw; Write-Output "mingw ok: $mingw" }
-          else { Get-ChildItem "C:\ProgramData\chocolatey\lib\mingw" -Recurse -Filter "ld.exe" | Select-Object -First 1 -ExpandProperty DirectoryName | ForEach-Object { Add-Content $env:GITHUB_PATH $_; Write-Output "mingw found: $_" } }
-          
-          # Windows SDK fxc.exe (HLSL shader compiler)
-          $sdk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory |
-                 Where-Object { $_.Name -match '^10\.' } |
-                 Sort-Object { [version]$_.Name } -Descending |
-                 Select-Object -First 1
-          $sdkBin = Join-Path $sdk.FullName "x64"
-          Add-Content $env:GITHUB_PATH $sdkBin
-          Write-Output "sdk bin: $sdkBin"
-
-      # 核心魔法：动态检测 VS 并强制锁定 v143 工具集以解决 Crypto++ 和 ICE 崩溃问题
-      - name: Detect Visual Studio
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          & $vswhere -all -products * -format value -property installationPath
-          Write-Output "---"
-          $ver = & $vswhere -latest -products * -property catalog_productLineVersion
-          Write-Output "installed productLine: $ver"
-          $yearMap = @{ '17' = '2022'; '18' = '2026' }
-          if ($ver -and $yearMap[$ver]) {
-            Add-Content $env:GITHUB_ENV "VS_GENERATOR=Visual Studio $ver $($yearMap[$ver])"
-            # 锁定 v143 兼容旧代码
-            Add-Content $env:GITHUB_ENV "VS_TOOLSET=v143"
-            Write-Output "selected: Visual Studio $ver $($yearMap[$ver]) with -T v143"
-          } else {
-            Add-Content $env:GITHUB_ENV "VS_GENERATOR="
-            Add-Content $env:GITHUB_ENV "VS_TOOLSET="
+          $ErrorActionPreference = 'Stop'
+          function Add-EnvFile([string]$path, [string]$line) {
+            [System.IO.File]::AppendAllText($path, $line + "`n")
           }
 
-      # 放弃 Ninja，回归原生的 Visual Studio Generator
-      - name: Configure CMake
-        shell: pwsh
-        run: |
-          if ($env:VS_GENERATOR) {
-            if ($env:VS_TOOLSET) {
-              cmake -B build -G "$env:VS_GENERATOR" -A x64 -T $env:VS_TOOLSET
-            } else {
-              cmake -B build -G "$env:VS_GENERATOR" -A x64
-            }
-          } else {
-            cmake -B build -A x64
+          # GNU ld (mingw64) is what CMakeLists.txt uses to turn resources/*
+          # into linkable objects. It is passed by path so that gcc/ld never
+          # end up on PATH and get picked as the C/C++ compiler.
+          $mingwBin = 'C:\msys64\mingw64\bin'
+          $ldExe = Join-Path $mingwBin 'ld.exe'
+          if (-not (Test-Path $ldExe)) {
+            & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -S --noconfirm --needed mingw-w64-x86_64-binutils'
+          }
+          if (-not (Test-Path $ldExe)) {
+            & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -Syu --noconfirm'
+            & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -S --noconfirm --needed mingw-w64-x86_64-binutils'
+          }
+          if (-not (Test-Path (Join-Path $mingwBin 'ld.exe'))) { throw 'ld.exe not available' }
+
+          # fxc.exe from the newest Windows SDK that ships it
+          $sdkBin = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Directory |
+            Where-Object { Test-Path (Join-Path $_.FullName 'x64\fxc.exe') } |
+            Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdkBin) { throw 'fxc.exe not found' }
+
+          # Prefer the CMake/Ninja bundled with VS; the project needs >= 3.28
+          # and every dependency's policy range, which 3.31.x satisfies.
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = $null
+          if (Test-Path $vsWhere) {
+            $vsRoot = (& $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
           }
 
-      # 构建项目，Visual Studio 生成器会默认把产物放在 build/Release 目录下
-      # 构建项目，Visual Studio 生成器会默认把产物放在 build/Release 目录下
-      - name: Build solution
-        continue-on-error: true    # <--- 新增这行：强行忽略 Exit code 1，让它变为 Success
-        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
-        
-      - name: Locate outputs
-        shell: pwsh
-        run: Get-ChildItem -Recurse -Include *.dll,*.pdb build | Select-Object FullName, Length
+          $cmake = $null
+          $ninja = $null
+          if ($vsRoot) {
+            $cmake = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+            $ninja = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
+          }
+          if (-not $cmake -or -not (Test-Path $cmake)) { $cmake = (Get-Command cmake.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $ninja -or -not (Test-Path $ninja)) { $ninja = (Get-Command ninja.exe -ErrorAction Stop).Source }
+          if (-not $cmake -or -not (Test-Path $cmake)) { throw 'cmake.exe not found' }
 
-      - name: Upload build artifact
+          Add-EnvFile $env:GITHUB_ENV "CMAKE_EXE=$cmake"
+          Add-EnvFile $env:GITHUB_ENV "NINJA_EXE=$ninja"
+          Add-EnvFile $env:GITHUB_ENV "LD_EXE=C:/msys64/mingw64/bin/ld.exe"
+          Add-EnvFile $env:GITHUB_PATH (Join-Path $sdkBin.FullName 'x64')
+          # ld.exe loads its own runtime DLLs from this directory. cl/ninja are
+          # passed explicitly, so having gcc here does not change the toolchain.
+          Add-EnvFile $env:GITHUB_PATH $mingwBin
+
+          # Shallow Crypto++ checkout: cryptopp-cmake would otherwise do a full
+          # clone of weidai11/cryptopp at configure time. The directory must be
+          # named "cryptopp" and sit next to its parent for the
+          # <cryptopp/aes.h> include style to resolve.
+          $cryptoppSrc = Join-Path $env:GITHUB_WORKSPACE '.cache/cryptopp-src/cryptopp'
+          if (-not (Test-Path (Join-Path $cryptoppSrc 'aes.h'))) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $cryptoppSrc) | Out-Null
+            git clone --depth 1 --branch CRYPTOPP_8_9_0 https://github.com/weidai11/cryptopp.git $cryptoppSrc
+            if (-not (Test-Path (Join-Path $cryptoppSrc 'aes.h'))) { throw 'Crypto++ checkout failed' }
+          }
+          Add-EnvFile $env:GITHUB_ENV "CRYPTOPP_SRC=$($cryptoppSrc -replace '\\','/')"
+
+          & $cmake --version | Select-Object -First 1
+          & $ninja --version
+          & $ldExe --version | Select-Object -First 1
+
+      - name: Patch build config
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $env:GITHUB_WORKSPACE 'CMakeLists.txt'
+          $text = [System.IO.File]::ReadAllText($file)
+
+          # Version from the workflow input
+          $oldVersion = 'set(SOLSTICE_VERSION "v1.0.0")'
+          if (-not $text.Contains($oldVersion)) { throw 'SOLSTICE_VERSION line not found' }
+          $newVersion = @(
+            'if(NOT SOLSTICE_VERSION)',
+            '    set(SOLSTICE_VERSION "v1.0.0")',
+            'endif()'
+          ) -join "`n"
+          $text = $text.Replace($oldVersion, $newVersion)
+
+          # Sources carry UTF-8 literals; the runner's code page is not UTF-8.
+          $oldBigobj = '    add_compile_options(/bigobj)'
+          if (-not $text.Contains($oldBigobj)) { throw '/bigobj line not found' }
+          $text = $text.Replace($oldBigobj, '    add_compile_options(/bigobj /utf-8)')
+
+          # ld -r -b binary writes <build>/resources/**.o, and neither Ninja nor
+          # ld creates intermediate directories.
+          $oldOut = '        set(out_f "${PROJECT_BINARY_DIR}/${in_f}.o")'
+          if (-not $text.Contains($oldOut)) { throw 'resource output line not found' }
+          $newOut = @(
+            '        set(out_f "${PROJECT_BINARY_DIR}/${in_f}.o")',
+            '        get_filename_component(out_dir "${out_f}" DIRECTORY)',
+            '        file(MAKE_DIRECTORY "${out_dir}")'
+          ) -join "`n"
+          $text = $text.Replace($oldOut, $newOut)
+
+          # fxc is invoked as `cmd /c fxc.exe ... > nul`. Under the Ninja
+          # generator VERBATIM can escape that redirect, and fxc then receives
+          # "> nul" as arguments. Drop the redirect; the output goes to the log.
+          $text = $text.Replace(' > nul', '')
+
+          # Unity build off. CMake batches 8 TUs per unity file regardless of
+          # directory, and several of them define file-scope statics with the
+          # same name (`static uintptr_t func` in Reach.cpp, FastEat.cpp,
+          # EditionFaker.cpp), which is a duplicate-definition error inside one
+          # batch. pch.hpp is force-included anyway, so the speedup is small.
+          $oldUnity = 'set(CMAKE_UNITY_BUILD TRUE)'
+          if (-not $text.Contains($oldUnity)) { throw 'CMAKE_UNITY_BUILD line not found' }
+          $text = $text.Replace($oldUnity, 'set(CMAKE_UNITY_BUILD FALSE)')
+
+          [System.IO.File]::WriteAllText($file, $text, (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host 'CMakeLists.txt patched'
+
+          # Kiero is built with /WX; a newer MSVC adding a warning would fail
+          # the whole build for a vendored dependency.
+          $kiero = Join-Path $env:GITHUB_WORKSPACE 'include/Kiero/CMakeLists.txt'
+          $kieroText = [System.IO.File]::ReadAllText($kiero)
+          if ($kieroText.Contains('target_compile_options(kiero PRIVATE /WX /W4)')) {
+            $kieroText = $kieroText.Replace('target_compile_options(kiero PRIVATE /WX /W4)', 'target_compile_options(kiero PRIVATE /W4)')
+            [System.IO.File]::WriteAllText($kiero, $kieroText, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host 'Kiero /WX removed'
+          }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:CMAKE_EXE -S . -B build -G Ninja `
+            -DCMAKE_MAKE_PROGRAM="$env:NINJA_EXE" `
+            -DCMAKE_BUILD_TYPE="$env:BUILD_TYPE" `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl `
+            -DLD_COMMAND="$env:LD_EXE" `
+            -DSOLSTICE_VERSION="$env:RELEASE_VERSION" `
+            -DCRYPTOPP_SOURCES="$env:CRYPTOPP_SRC" `
+            -DBUILD_TOOLS=OFF `
+            -DBUILD_XAUDIO_WIN8=OFF `
+            -DBUILD_XAUDIO_WIN10=ON `
+            -DCRYPTOPP_BUILD_TESTING=OFF `
+            -DCRYPTOPP_INSTALL=OFF `
+            -DCRYPTOPP_DISABLE_ASM=ON
+          if ($LASTEXITCODE -ne 0) { throw "configure failed: $LASTEXITCODE" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:CMAKE_EXE --build build --target Solstice --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Get-ChildItem build -Recurse -Filter 'Solstice.dll' | Select-Object -First 1
+          if (-not $dll) { throw 'Solstice.dll not found' }
+
+          # Linker PDB sits next to the DLL; the compiler PDB under
+          # CMakeFiles/Solstice.dir is not the one we ship.
+          $pdbPath = Join-Path $dll.DirectoryName 'Solstice.pdb'
+          if (-not (Test-Path $pdbPath)) {
+            $pdb = Get-ChildItem build -Recurse -Filter 'Solstice.pdb' |
+              Where-Object { $_.DirectoryName -notmatch 'CMakeFiles' } |
+              Select-Object -First 1
+            if ($pdb) { $pdbPath = $pdb.FullName }
+          }
+          if (-not (Test-Path $pdbPath)) { throw 'Solstice.pdb not found' }
+          Write-Host "DLL: $($dll.FullName)"
+          Write-Host "PDB: $pdbPath"
+
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item $dll.FullName (Join-Path $dist 'Solstice.dll') -Force
+          Copy-Item $pdbPath (Join-Path $dist 'Solstice.pdb') -Force
+
+          $name = "Solstice-$env:RELEASE_VERSION-$env:BUILD_TYPE"
+          $zip = Join-Path $env:GITHUB_WORKSPACE "$name.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (Test-Path $sevenZip) {
+            & $sevenZip a -tzip -mx=3 "$zip" "$dist\*" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7z failed: $LASTEXITCODE" }
+          } else {
+            Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
+          }
+          if (-not (Test-Path $zip)) { throw 'zip not created' }
+
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "ZIP_PATH=$zip`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "ZIP_NAME=$name.zip`n")
+          Get-Item $zip | Format-List Name, Length
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: solstice-dll
-          path: |
-            build/Release/*.dll
-            build/Release/*.pdb
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
           if-no-files-found: error
+          compression-level: 0
 
-      # 仅在手动点击运行 (workflow_dispatch) 的时候才发布 Release
-      - name: Publish GitHub Release
-        if: github.event_name == 'workflow_dispatch'
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version }}
-          name: Release ${{ github.event.inputs.version }}
-          files: build/Release/*.dll
-          generate_release_notes: true
+          tag_name: ${{ inputs.version }}
+          name: Solstice ${{ inputs.version }} (${{ inputs.build_type }})
+          files: ${{ env.ZIP_PATH }}
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body: |
+            Solstice ${{ inputs.version }} — ${{ inputs.build_type }}
+
+            - Commit: `${{ github.sha }}`
+            - Contents: `Solstice.dll`, `Solstice.pdb`
+            - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $md = "### $env:RELEASE_VERSION / $env:BUILD_TYPE`n`nArtifact: $env:ZIP_NAME`n"
+          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $md)
