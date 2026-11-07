@@ -12,6 +12,10 @@ add_compile_definitions(__PRIVATE_DEBUG__)
 add_compile_definitions(__PRIVATE_BUILD__)
 add_compile_definitions(__DEBUG__)
 
+# 新增：全局压制旧版 MSVC 迭代器的弃用警告，防止被当作 error 导致编译失败
+add_compile_definitions(_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING)
+add_compile_definitions(_SILENCE_ALL_MS_EXT_DEPRECATION_WARNINGS)
+
 find_program(LD_COMMAND ld)
 
 if (NOT LD_COMMAND)
