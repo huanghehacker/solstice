@@ -1,86 +1,68 @@
-name: Build Solstice (Windows)
+name: CMake Windows Build
 
 on:
-  push:
-    branches: [ "main", "release" ]
   workflow_dispatch:
+    inputs:
+      version:
+        description: '发布 Release 的版本号 (例如 v1.0.0)'
+        required: true
+        default: 'v1.0.0'
 
 env:
   BUILD_TYPE: Release
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write # 发布 Release 需要写入权限
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Install MinGW (provides ld.exe for resource embedding)
-      run: choco install mingw -y --no-progress
+      - name: Install MSYS2 and binutils
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: mingw-w64-x86_64-binutils
 
-    - name: Add ld.exe and fxc.exe to PATH
-      shell: pwsh
-      run: |
-        # MinGW binutils (ld) from chocolatey
-        $mingw = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
-        if (Test-Path $mingw) { Add-Content $env:GITHUB_PATH $mingw; Write-Output "mingw ok: $mingw" }
-        else { Get-ChildItem "C:\ProgramData\chocolatey\lib\mingw" -Recurse -Filter "ld.exe" | Select-Object -First 1 -ExpandProperty DirectoryName | ForEach-Object { Add-Content $env:GITHUB_PATH $_; Write-Output "mingw found: $_" } }
-        # Windows SDK fxc.exe (HLSL shader compiler)
-        $sdk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory |
-               Where-Object { $_.Name -match '^10\.' } |
-               Sort-Object { [version]$_.Name } -Descending |
-               Select-Object -First 1
-        $sdkBin = Join-Path $sdk.FullName "x64"
-        Add-Content $env:GITHUB_PATH $sdkBin
-        Write-Output "sdk bin: $sdkBin"
+      - name: Add MSYS2 mingw64 bin to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-    - name: Detect Visual Studio
-      shell: pwsh
-      run: |
-        # Diagnostics: list actual installed VS instances
-        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        & $vswhere -all -products * -format value -property installationPath
-        Write-Output "---"
-        # cmake --help lists SUPPORTED generator names, not installed instances.
-        # Find the actually installed instance and map it to a generator name.
-        $ver = & $vswhere -latest -products * -property catalog_productLineVersion
-        Write-Output "installed productLine: $ver"
-        $yearMap = @{ '17' = '2022'; '18' = '2026' }
-        if ($ver -and $yearMap[$ver]) {
-          Add-Content $env:GITHUB_ENV "VS_GENERATOR=Visual Studio $ver $($yearMap[$ver])"
-          # Old deps (stdext iterators etc.) need the legacy v143 toolset (MSVC 2022 compiler)
-          Add-Content $env:GITHUB_ENV "VS_TOOLSET=v143"
-          Write-Output "selected: Visual Studio $ver $($yearMap[$ver]) with -T v143"
-        } else {
-          Add-Content $env:GITHUB_ENV "VS_GENERATOR="
-          Add-Content $env:GITHUB_ENV "VS_TOOLSET="
-        }
+      # 替代以前繁琐的脚本，完美解决 MSVC 环境报错
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-    - name: Configure CMake
-      shell: pwsh
-      run: |
-        if ($env:VS_GENERATOR) {
-          if ($env:VS_TOOLSET) {
-            cmake -B build -G "$env:VS_GENERATOR" -A x64 -T $env:VS_TOOLSET
-          } else {
-            cmake -B build -G "$env:VS_GENERATOR" -A x64
-          }
-        } else {
-          cmake -B build -A x64
-        }
+      # 换用 Ninja 构建，速度直接起飞
+      - name: Configure CMake
+        shell: pwsh
+        run: cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
 
-    - name: Build
-      run: cmake --build build --config Release --parallel
+      - name: Build solution
+        shell: pwsh
+        run: cmake --build build
 
-    - name: Locate outputs
-      shell: pwsh
-      run: Get-ChildItem -Recurse -Include *.dll,*.pdb build | Select-Object FullName, Length
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solstice-dll
+          path: build/**/*.dll
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: Solstice-Release-x64
-        path: |
-          build/Release/*.dll
-          build/Release/*.pdb
-        if-no-files-found: error
+      # 仅在手动点击运行 (workflow_dispatch) 的时候才发布 Release
+      - name: Publish GitHub Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: Release ${{ github.event.inputs.version }}
+          files: build/**/*.dll
+          generate_release_notes: true
